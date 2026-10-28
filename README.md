@@ -436,6 +436,7 @@ By default the server communicates over **stdio**, which is what Claude Desktop,
 - `GARMIN_MCP_TRANSPORT`: `stdio` (default), `streamable-http`, or `sse`
 - `GARMIN_MCP_HOST`: bind address for HTTP transports (default `127.0.0.1`; set to `0.0.0.0` only when the endpoint is fronted by an authenticating reverse proxy)
 - `GARMIN_MCP_PORT`: bind port for HTTP transports (default `8000`)
+- `GARMIN_MCP_PATH_SECRET`: optional secret path segment; when set, the MCP endpoint moves to `/<secret>/mcp` (see below)
 
 ```bash
 GARMIN_MCP_TRANSPORT=streamable-http garmin-mcp
@@ -447,6 +448,18 @@ When an HTTP transport is selected:
 - A plain **`GET /healthz`** endpoint is exposed for liveness/readiness probes.
 
 The server itself performs **no authentication** on the HTTP endpoint — put it behind a reverse proxy (nginx, Traefik, Authelia, etc.) if it is reachable beyond localhost.
+
+#### Secret connector URL
+
+For clients that can only be given a URL (such as a claude.ai custom connector), set `GARMIN_MCP_PATH_SECRET` so the endpoint is reachable only by someone who knows it:
+
+```bash
+GARMIN_MCP_PATH_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+```
+
+- MCP clients then connect to **`/<secret>/mcp`** (SSE: `/<secret>/sse`); the bare `/mcp` path returns 404. `/healthz` stays public.
+- The secret must be at least 32 URL-safe characters (`A-Z a-z 0-9 - _`); the server refuses to start otherwise.
+- The secret is masked as `***` in the server's own access log. Treat the full URL like a password, and rotate it by changing the variable and updating the client's URL.
 
 ### Garmin Connect China (garmin.cn)
 
