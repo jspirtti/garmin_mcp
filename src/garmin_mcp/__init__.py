@@ -3,8 +3,10 @@ Modular MCP Server for Garmin Connect Data
 """
 
 import os
+import re
 import sys
 import base64
+import logging
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -165,12 +167,62 @@ def _parse_transport_config() -> tuple[str, str, int]:
             f"Invalid GARMIN_MCP_TRANSPORT {transport!r}; "
             f"expected one of {', '.join(_VALID_TRANSPORTS)}"
         )
-    # Bind to loopback by default: the HTTP transport performs no authentication,
-    # so a 0.0.0.0 default would expose full read/write access to the user's
-    # Garmin account to the whole network. Opt in explicitly with GARMIN_MCP_HOST.
+    # Bind to loopback by default: unless GARMIN_MCP_PATH_SECRET is set, the HTTP
+    # transport performs no authentication, so a 0.0.0.0 default would expose full
+    # read/write access to the user's Garmin account to the whole network. Opt in
+    # explicitly with GARMIN_MCP_HOST.
     http_host = os.getenv("GARMIN_MCP_HOST", "127.0.0.1")
     http_port = int(os.getenv("GARMIN_MCP_PORT", "8000"))
     return transport, http_host, http_port
+
+
+# A secret path segment is the one credential a client can carry without OAuth
+# or custom headers (e.g. a claude.ai custom connector): the URL itself. When
+# GARMIN_MCP_PATH_SECRET is set, the MCP endpoint moves under /<secret>/ and the
+# bare /mcp path returns 404.
+_PATH_SECRET_MIN_LENGTH = 32
+_PATH_SECRET_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _parse_path_secret() -> str | None:
+    """Read GARMIN_MCP_PATH_SECRET. Raises ValueError if it is set but weak."""
+    secret = os.getenv("GARMIN_MCP_PATH_SECRET", "").strip()
+    if not secret:
+        return None
+    if len(secret) < _PATH_SECRET_MIN_LENGTH or not _PATH_SECRET_PATTERN.fullmatch(secret):
+        raise ValueError(
+            f"GARMIN_MCP_PATH_SECRET must be at least {_PATH_SECRET_MIN_LENGTH} "
+            "URL-safe characters (A-Z, a-z, 0-9, '-', '_'). Generate one with: "
+            "python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        )
+    return secret
+
+
+def _http_paths(secret: str | None) -> dict[str, str]:
+    """FastMCP endpoint paths, nested under /<secret>/ when a secret is set."""
+    prefix = f"/{secret}" if secret else ""
+    return {
+        "streamable_http_path": f"{prefix}/mcp",
+        "sse_path": f"{prefix}/sse",
+        "message_path": f"{prefix}/messages/",
+    }
+
+
+class _RedactFilter(logging.Filter):
+    """Masks a secret in log records, e.g. request paths in uvicorn's access log."""
+
+    def __init__(self, secret: str):
+        super().__init__()
+        self._secret = secret
+
+    def _redact(self, value):
+        return value.replace(self._secret, "***") if isinstance(value, str) else value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._redact(arg) for arg in record.args)
+        return True
 
 
 class _ToolFilter:
@@ -381,8 +433,10 @@ def main():
     #   GARMIN_MCP_TRANSPORT - stdio (default) | streamable-http | sse
     #   GARMIN_MCP_HOST      - bind address for HTTP transports (default 127.0.0.1)
     #   GARMIN_MCP_PORT      - bind port for HTTP transports (default 8000)
+    #   GARMIN_MCP_PATH_SECRET - serve MCP under /<secret>/ instead of / (HTTP only)
     try:
         transport, http_host, http_port = _parse_transport_config()
+        path_secret = _parse_path_secret() if transport != "stdio" else None
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
@@ -416,8 +470,10 @@ def main():
     activity_analysis.configure(garmin_client)
 
     # Create the MCP app, wrapped so the env-var filter can drop tools.
-    # host/port only matter for the HTTP transports; stdio ignores them.
-    fastmcp = FastMCP("Garmin Connect v1.0", host=http_host, port=http_port)
+    # host/port/paths only matter for the HTTP transports; stdio ignores them.
+    fastmcp = FastMCP(
+        "Garmin Connect v1.0", host=http_host, port=http_port, **_http_paths(path_secret)
+    )
     app = _ToolFilter(fastmcp, enabled_tools, disabled_tools)
     if enabled_tools:
         print(f"Tool filter: allowlist of {len(enabled_tools)} tool(s).", file=sys.stderr)
@@ -466,6 +522,16 @@ def main():
             f"Serving MCP over {transport} on {http_host}:{http_port}",
             file=sys.stderr,
         )
+        if path_secret:
+            # Keep the secret out of uvicorn's access log, which logs request paths.
+            logging.getLogger("uvicorn.access").addFilter(_RedactFilter(path_secret))
+            print("MCP endpoint is served under GARMIN_MCP_PATH_SECRET.", file=sys.stderr)
+        elif http_host not in ("127.0.0.1", "localhost", "::1"):
+            print(
+                "WARNING: MCP endpoint has no authentication and is not bound to "
+                "loopback. Set GARMIN_MCP_PATH_SECRET or use an authenticating proxy.",
+                file=sys.stderr,
+            )
 
     # Run the MCP server
     app.run(transport=transport)
